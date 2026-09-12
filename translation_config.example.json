@@ -15,6 +15,7 @@
     "TRK",
     "VIT"
   ],
+  "default_maximized": false,
   "api_type": "deepl_free",
   "provider_configs": {
     "deepl_free": {

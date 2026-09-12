@@ -204,6 +204,61 @@ class TranslationProviderTests(unittest.TestCase):
             )
             self.assertNotIn('region', saved_config['provider_configs']['volcengine'])
 
+    def test_default_maximized_setting_is_loaded_and_saved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / 'translation_config.json'
+            config_path.write_text(
+                json.dumps({'default_fullscreen': True}),
+                encoding='utf-8'
+            )
+            app = TranslationApp.__new__(TranslationApp)
+            app.default_langs = []
+            app.default_maximized = False
+            app.api_type = 'google'
+            app.provider_configs = default_provider_configs()
+            app.baidu_app_id = ''
+            app.baidu_secret_key = ''
+            app.logger = None
+            app.log = lambda _message: None
+            original_config_file = translation_gui.CONFIG_FILE
+            translation_gui.CONFIG_FILE = str(config_path)
+            try:
+                app.load_config()
+                self.assertTrue(app.default_maximized)
+                app.default_maximized = False
+                app.save_config()
+            finally:
+                translation_gui.CONFIG_FILE = original_config_file
+
+            saved_config = json.loads(config_path.read_text(encoding='utf-8'))
+            self.assertFalse(saved_config['default_maximized'])
+            self.assertNotIn('default_fullscreen', saved_config)
+
+    def test_window_mode_can_switch_between_maximized_and_windowed(self):
+        class FakeRoot:
+            def __init__(self):
+                self.state_value = 'normal'
+                self.geometry_value = None
+
+            def state(self, value=None):
+                if value is None:
+                    return self.state_value
+                self.state_value = value
+
+            def geometry(self, value):
+                self.geometry_value = value
+
+        app = TranslationApp.__new__(TranslationApp)
+        app.root = FakeRoot()
+        app.log = lambda _message: None
+
+        self.assertTrue(app._apply_window_mode(True))
+        self.assertEqual(app.root.state_value, 'zoomed')
+
+        self.assertTrue(app._apply_window_mode(False))
+        self.assertEqual(app.root.state_value, 'normal')
+        self.assertEqual(app.root.geometry_value, '1280x850')
+
     def test_deepl_free_uses_the_free_endpoint_and_auth_header(self):
         app = build_app(FakeResponse({'translations': [{'text': 'Hello'}]}))
         app.provider_configs['deepl_free']['auth_key'] = 'test-key'

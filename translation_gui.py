@@ -402,6 +402,7 @@ class TranslationApp:
         self.table_dir = os.path.dirname(os.path.abspath(__file__))   # 翻译表保存目录
         self.default_langs = DEFAULT_LANGS.copy()  # 默认语言列表
         self.show_all_langs = False     # 是否显示所有语言
+        self.default_maximized = False  # 启动时是否默认窗口最大化
         self.translation_complete = False  # 翻译是否完成
         self.translation_failures = []
         self.headless = False  # 是否为无界面模式（命令行）
@@ -446,9 +447,11 @@ class TranslationApp:
     def load_config(self):
         """
         加载配置文件
-        从translation_config.json读取用户自定义的默认语言设置和API配置。
+        从translation_config.json读取用户自定义的默认语言、窗口模式和API配置。
         旧版百度顶级配置会自动迁移到 provider_configs。
         """
+        if not hasattr(self, 'default_maximized'):
+            self.default_maximized = False
         if os.path.exists(CONFIG_FILE):
             config_migrated = False
             try:
@@ -456,6 +459,15 @@ class TranslationApp:
                     config = json.load(f)
                     if 'default_langs' in config:
                         self.default_langs = config['default_langs']
+                    saved_maximized = config.get('default_maximized')
+                    legacy_fullscreen = config.get('default_fullscreen')
+                    if isinstance(saved_maximized, bool):
+                        self.default_maximized = saved_maximized
+                    elif isinstance(legacy_fullscreen, bool):
+                        # Migrate the previous full-screen setting to window maximization.
+                        self.default_maximized = legacy_fullscreen
+                    if 'default_fullscreen' in config:
+                        config_migrated = True
                     saved_api_type = config.get('api_type')
                     if saved_api_type in API_PROVIDERS:
                         self.api_type = saved_api_type
@@ -527,6 +539,7 @@ class TranslationApp:
         self._sync_legacy_baidu_credentials()
         config = {
             'default_langs': self.default_langs,
+            'default_maximized': bool(getattr(self, 'default_maximized', False)),
             'api_type': self.api_type,
             'provider_configs': self.provider_configs,
             # Retain these keys so configuration files stay compatible with older releases.
@@ -610,7 +623,11 @@ class TranslationApp:
             bind_events(icon_lbl, icon_lbl)
             bind_events(text_lbl, text_lbl)
             
-            nav_btn_frame.bind('<Button-1>', lambda e, n=name: self.show_content(n))
+            for widget in (btn_frame, nav_btn_frame, icon_lbl, text_lbl):
+                widget.bind(
+                    '<Button-1>',
+                    lambda e, n=name: self._handle_nav_click(e, n)
+                )
             self.nav_buttons[name] = btn_frame
         
         self.current_content = None
@@ -708,6 +725,15 @@ class TranslationApp:
         self.logo_card.grid(row=1, column=0, sticky='nsew')
         self.logo_card.grid_rowconfigure(1, weight=1)
         self.logo_card.grid_remove()
+
+        self.settings_card = ttk.LabelFrame(
+            self.tab_frame,
+            text=" 设置选项 ",
+            style='Card.TLabelframe',
+            padding=12
+        )
+        self.settings_card.grid(row=1, column=0, sticky='nsew')
+        self.settings_card.grid_remove()
         
         self.current_tab = 'langs'
         
@@ -876,14 +902,22 @@ class TranslationApp:
                   justify='left').pack(anchor='w', pady=(4, 0))
         
         self.init_logo_settings()
+        self.init_window_settings()
         
         self.update_lang_display()
+        self._apply_window_mode(self.default_maximized)
     
     def show_content(self, name):
         if name == 'logo':
             self.switch_tab('logo')
         elif name == 'langs':
             self.switch_tab('langs')
+        elif name == 'settings':
+            self.switch_tab('settings')
+
+    def _handle_nav_click(self, _event, name):
+        self.show_content(name)
+        return 'break'
     
     def switch_tab(self, tab_name):
         if self.current_tab == tab_name:
@@ -893,6 +927,8 @@ class TranslationApp:
             self.lang_card.grid_remove()
         elif self.current_tab == 'logo':
             self.logo_card.grid_remove()
+        elif self.current_tab == 'settings':
+            self.settings_card.grid_remove()
         
         if tab_name == 'langs':
             self.lang_card.grid(row=1, column=0, sticky='nsew')
@@ -902,8 +938,77 @@ class TranslationApp:
             self.logo_card.grid(row=1, column=0, sticky='nsew')
             self.lang_tab_btn.configure(style='Tab.TButton')
             self.logo_tab_btn.configure(style='TabActive.TButton')
+        elif tab_name == 'settings':
+            self.settings_card.grid(row=1, column=0, sticky='nsew')
+            self.lang_tab_btn.configure(style='Tab.TButton')
+            self.logo_tab_btn.configure(style='Tab.TButton')
         
         self.current_tab = tab_name
+
+    def init_window_settings(self):
+        settings_main = ttk.Frame(self.settings_card, style='Card.TFrame')
+        settings_main.pack(fill='both', expand=True, padx=8, pady=8)
+
+        ttk.Label(
+            settings_main,
+            text="窗口启动模式",
+            font=('Segoe UI', 11, 'bold'),
+            foreground='#2D2B4E'
+        ).pack(anchor='w')
+        ttk.Label(
+            settings_main,
+            text="选择程序启动时使用窗口化还是窗口最大化。保存后立即应用，并在下次启动时保持。",
+            font=('Segoe UI', 9),
+            foreground='#6E6E73',
+            wraplength=620,
+            justify='left'
+        ).pack(anchor='w', pady=(4, 14))
+
+        self.window_mode_var = tk.StringVar(
+            value='maximized' if self.default_maximized else 'windowed'
+        )
+        ttk.Radiobutton(
+            settings_main,
+            text="默认窗口化",
+            variable=self.window_mode_var,
+            value='windowed'
+        ).pack(anchor='w', pady=4)
+        ttk.Radiobutton(
+            settings_main,
+            text="默认窗口最大化",
+            variable=self.window_mode_var,
+            value='maximized'
+        ).pack(anchor='w', pady=4)
+
+        ttk.Button(
+            settings_main,
+            text="保存并应用",
+            command=self.save_window_settings
+        ).pack(anchor='w', pady=(16, 0))
+
+    def _apply_window_mode(self, maximized):
+        if self.root.state() == 'withdrawn':
+            return True
+        try:
+            self.root.state('zoomed' if maximized else 'normal')
+            if not maximized:
+                self.root.geometry("1280x850")
+            return True
+        except tk.TclError as exc:
+            self.log(f"窗口模式设置失败: {exc}")
+            return False
+
+    def save_window_settings(self):
+        self.default_maximized = self.window_mode_var.get() == 'maximized'
+        applied = self._apply_window_mode(self.default_maximized)
+        self.save_config()
+        if applied:
+            messagebox.showinfo("设置", "窗口启动模式已保存并应用。")
+        else:
+            messagebox.showwarning(
+                "设置",
+                "窗口启动模式已保存，但当前系统应用失败，请重启程序后重试。"
+            )
     
     def init_logo_settings(self):
         self.logo_image_path = None
