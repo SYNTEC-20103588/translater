@@ -1,0 +1,7 @@
+translation_config.json
+translation_table.json
+__pycache__/
+*.py[cod]
+*.exe
+build/
+dist/

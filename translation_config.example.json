@@ -1,0 +1,64 @@
+{
+  "default_langs": [
+    "ARA",
+    "CHT",
+    "ELL",
+    "ENG",
+    "ESP",
+    "GER",
+    "ITA",
+    "JPN",
+    "KOR",
+    "PLK",
+    "PTG",
+    "RUS",
+    "TRK",
+    "VIT"
+  ],
+  "api_type": "deepl_free",
+  "provider_configs": {
+    "deepl_free": {
+      "auth_key": "",
+      "endpoint": "https://api-free.deepl.com/v2"
+    },
+    "baidu": {
+      "app_id": "",
+      "secret_key": ""
+    },
+    "youdao": {
+      "app_key": "",
+      "app_secret": ""
+    },
+    "niutrans": {
+      "api_key": "",
+      "endpoint": "https://api.niutrans.com/NiuTransServer/translation"
+    },
+    "tencent": {
+      "secret_id": "",
+      "secret_key": "",
+      "region": "ap-beijing",
+      "endpoint": "https://tmt.tencentcloudapi.com"
+    },
+    "volcengine": {
+      "access_key": "",
+      "secret_key": "",
+      "endpoint": "https://translate.volcengineapi.com"
+    },
+    "aliyun": {
+      "access_key_id": "",
+      "access_key_secret": "",
+      "scene": "general",
+      "endpoint": "https://mt.cn-hangzhou.aliyuncs.com/api/translate/web/general",
+      "batch_endpoint": "https://mt.cn-hangzhou.aliyuncs.com/",
+      "region_id": "cn-hangzhou",
+      "batch_api_type": "translate_standard"
+    },
+    "deepl_pro": {
+      "auth_key": "",
+      "endpoint": "https://api.deepl.com/v2"
+    },
+    "google": {}
+  },
+  "baidu_app_id": "",
+  "baidu_secret_key": ""
+}
