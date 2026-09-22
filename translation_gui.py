@@ -413,6 +413,7 @@ class TranslationApp:
         self.diskc_root = ""          # DiskC根目录路径
         self.diskc_res_source = ""    # CHS.res解压后的prepared路径
         self.diskc_xml_map = {}       # prepared_path -> 相对于String目录的子路径
+        self.diskc_plugin_source = "" # Plugin/Config/CHS.xml的prepared路径
         
         # API配置变量。保留百度旧字段，兼容已有 translation_config.json。
         self.api_type = 'google'
@@ -1111,6 +1112,13 @@ class TranslationApp:
                 self.log(f"刷新文件夹: {os.path.basename(folder)} → {count} 个文件")
         self.log(f"总计扫描到 {len(self.source_files)} 个可处理文件")
 
+    def _reset_diskc_state(self):
+        self.diskc_mode = False
+        self.diskc_root = ""
+        self.diskc_res_source = ""
+        self.diskc_xml_map = {}
+        self.diskc_plugin_source = ""
+
     def setup_diskc_sources(self, diskc_root=None):
         if diskc_root is None:
             folder = filedialog.askdirectory(title="选择DiskC根目录")
@@ -1118,16 +1126,14 @@ class TranslationApp:
                 return
             diskc_root = folder
 
+        self._reset_diskc_state()
         self.diskc_root = diskc_root
         self.diskc_mode = True
-        self.diskc_res_source = ""
-        self.diskc_xml_map = {}
         self.source_files = []
         self.file_listbox.delete(0, tk.END)
         self.source_folders = []
         self.source_folder = diskc_root
         self.output_dir = diskc_root
-        self.diskc_plugin_source = ""
 
         res_path = os.path.join(diskc_root, 'OpenCNC', 'Bin', 'Language', 'CHS.res')
         prepared_res = self.prepare_file(res_path)
@@ -1269,6 +1275,9 @@ class TranslationApp:
         self.file_listbox.delete(0, tk.END)
         self.source_files = []
         self.source_folders = []
+        self.source_folder = ""
+        self._reset_diskc_state()
+        self.update_stats()
     
     def toggle_lang_display(self):
         """
@@ -3053,10 +3062,23 @@ class TranslationApp:
         # 提取中文文本
         texts = self.extract_chinese_texts()
         self.log(f"共需处理 {len(texts)} 条中文文本")
+        task_texts = [
+            text
+            for text in {
+                self._normalize_text(source_text)
+                for source_text in texts
+            }
+            if text in self.translation_table
+        ]
+        self.log(
+            f"本次任务限定为当前源文件的 {len(task_texts)} 条文本，"
+            "不会翻译翻译记忆库中的历史条目"
+        )
         
         # 计算需要翻译的数量
         total_needed = 0
-        for text, langs in self.translation_table.items():
+        for text in task_texts:
+            langs = self.translation_table[text]
             for lang in self.selected_langs:
                 if lang not in langs:
                     langs[lang] = ''
@@ -3080,7 +3102,7 @@ class TranslationApp:
             # 按文本分组：相同文本的多语言翻译请求合并
             # 结构: {text: [lang1, lang2, ...]}
             text_to_langs = {}
-            for text in self.translation_table.keys():
+            for text in task_texts:
                 for lang in self.selected_langs:
                     if lang not in self.translation_table[text]:
                         self.translation_table[text][lang] = ''
@@ -3217,7 +3239,7 @@ class TranslationApp:
                         )
 
             self.log("执行智能缩写...")
-            self.abbreviate_translations()
+            self.abbreviate_translations(task_texts)
             self.save_translation_table()
             self._run_on_ui(lambda: self._update_progress(100, total_needed))
             self.translation_failures = failures
@@ -3232,7 +3254,7 @@ class TranslationApp:
         # 启动翻译线程
         threading.Thread(target=translate_thread, daemon=True).start()
     
-    def abbreviate_translations(self):
+    def abbreviate_translations(self, texts=None):
         import re
 
         max_lengths = {
@@ -3328,16 +3350,21 @@ class TranslationApp:
             result = ' '.join(kept)
             return result if len(result) <= limit else f"{result[:limit-1]}…"
 
+        texts_to_check = (
+            list(self.translation_table)
+            if texts is None
+            else [text for text in texts if text in self.translation_table]
+        )
         abbreviated_count = 0
         total_to_check = sum(
-            1 for text in self.translation_table.keys()
+            1 for text in texts_to_check
             for lang in self.selected_langs
             if lang in self.translation_table[text] and self.translation_table[text][lang]
             and len(self.translation_table[text][lang]) > max_lengths.get(lang, max_lengths['default'])
             and lang not in ('CHT', 'CHS', 'ZHH', 'ZHI', 'ZHM')
         )
         checked = 0
-        for text in self.translation_table.keys():
+        for text in texts_to_check:
             for lang in self.selected_langs:
                 if lang not in self.translation_table[text] or not self.translation_table[text][lang]:
                     continue

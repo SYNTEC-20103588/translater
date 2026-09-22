@@ -62,6 +62,14 @@ class FakeWidget:
         self.value = value
 
 
+class FakeListbox:
+    def __init__(self):
+        self.delete_calls = []
+
+    def delete(self, *args):
+        self.delete_calls.append(args)
+
+
 def build_app(response):
     app = TranslationApp.__new__(TranslationApp)
     app.provider_configs = default_provider_configs()
@@ -96,7 +104,7 @@ def build_batch_workflow_app(provider, item_count):
     app.progress_label = FakeWidget()
     app.extract_chinese_texts = lambda: set(app.translation_table)
     app.save_translation_table = lambda: None
-    app.abbreviate_translations = lambda: None
+    app.abbreviate_translations = lambda _texts=None: None
     if provider == 'tencent':
         app.provider_configs[provider]['secret_id'] = 'test-id'
         app.provider_configs[provider]['secret_key'] = 'test-secret'
@@ -115,6 +123,32 @@ def wait_for_translation(app):
 
 
 class TranslationProviderTests(unittest.TestCase):
+    def test_clear_files_resets_diskc_workflow_state(self):
+        app = TranslationApp.__new__(TranslationApp)
+        app.file_listbox = FakeListbox()
+        app.source_files = ['C:\\DiskC\\prepared.xml']
+        app.source_folders = ['C:\\DiskC']
+        app.source_folder = 'C:\\DiskC'
+        app.diskc_mode = True
+        app.diskc_root = 'C:\\DiskC'
+        app.diskc_res_source = 'C:\\DiskC\\_res_converted\\CHS'
+        app.diskc_xml_map = {
+            'C:\\DiskC\\String\\CHS.xml': 'CHS.xml',
+        }
+        app.diskc_plugin_source = 'C:\\DiskC\\Plugin\\Config\\CHS.xml'
+
+        app.clear_files()
+
+        self.assertEqual(app.file_listbox.delete_calls, [(0, translation_gui.tk.END)])
+        self.assertEqual(app.source_files, [])
+        self.assertEqual(app.source_folders, [])
+        self.assertEqual(app.source_folder, '')
+        self.assertFalse(app.diskc_mode)
+        self.assertEqual(app.diskc_root, '')
+        self.assertEqual(app.diskc_res_source, '')
+        self.assertEqual(app.diskc_xml_map, {})
+        self.assertEqual(app.diskc_plugin_source, '')
+
     def test_free_providers_are_listed_first(self):
         self.assertEqual(
             list(API_PROVIDERS)[:3],
@@ -458,6 +492,62 @@ class TranslationProviderTests(unittest.TestCase):
         self.assertEqual(sorted(len(texts) for _, texts, _ in batch_calls), [1, 50])
         self.assertTrue(all(provider == 'deepl_free' for provider, _, _ in batch_calls))
         self.assertTrue(all(target == 'en-US' for _, _, target in batch_calls))
+        self.assertEqual(app.translation_failures, [])
+
+    def test_translation_workflow_ignores_stale_translation_memory_entries(self):
+        app = build_batch_workflow_app('deepl_free', 2)
+        app.extract_chinese_texts = lambda: {'测试文本0'}
+        batch_calls = []
+
+        def translate_batch(provider, texts, target_lang):
+            batch_calls.append((provider, list(texts), target_lang))
+            return [TranslationResult(True, f'Translated {text}') for text in texts]
+
+        app._translate_provider_text_batch = translate_batch
+        app.start_translation()
+        wait_for_translation(app)
+
+        self.assertTrue(app.translation_complete)
+        self.assertEqual(
+            batch_calls,
+            [('deepl_free', ['测试文本0'], 'en-US')]
+        )
+        self.assertEqual(
+            app.translation_table['测试文本0']['USA'],
+            'Translated 测试文本0'
+        )
+        self.assertEqual(app.translation_table['测试文本1']['USA'], '')
+        self.assertEqual(app.translation_failures, [])
+
+    def test_translation_workflow_leaves_stale_memory_entries_untouched(self):
+        app = build_batch_workflow_app('deepl_free', 3)
+        app.extract_chinese_texts = lambda: {'测试文本0'}
+        app.abbreviate_translations = TranslationApp.abbreviate_translations.__get__(
+            app,
+            TranslationApp
+        )
+        stale_translation = (
+            'Historical translation must remain untouched even though it is '
+            'much longer than forty characters.'
+        )
+        app.translation_table['测试文本2']['USA'] = stale_translation
+        batch_calls = []
+
+        def translate_batch(provider, texts, target_lang):
+            batch_calls.append((provider, list(texts), target_lang))
+            return [TranslationResult(True, f'Translated {text}') for text in texts]
+
+        app._translate_provider_text_batch = translate_batch
+        app.start_translation()
+        wait_for_translation(app)
+
+        self.assertTrue(app.translation_complete)
+        self.assertEqual(
+            batch_calls,
+            [('deepl_free', ['测试文本0'], 'en-US')]
+        )
+        self.assertEqual(app.translation_table['测试文本1']['USA'], '')
+        self.assertEqual(app.translation_table['测试文本2']['USA'], stale_translation)
         self.assertEqual(app.translation_failures, [])
 
     def test_tencent_rate_limiter_reserves_a_global_request_slot(self):
