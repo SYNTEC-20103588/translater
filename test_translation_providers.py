@@ -87,6 +87,22 @@ class FakeValue:
         self.value = value
 
 
+class FakeLanguageFrame:
+    def winfo_children(self):
+        return []
+
+    def update_idletasks(self):
+        pass
+
+
+class FakeLanguageCheckbutton:
+    def __init__(self, _master, **kwargs):
+        self.text = kwargs['text']
+
+    def grid(self, **_kwargs):
+        pass
+
+
 class FakeMenu:
     def __init__(self):
         self.popup_calls = []
@@ -194,6 +210,55 @@ def build_mb_backup_app():
 
 
 class TranslationProviderTests(unittest.TestCase):
+    def test_language_checkboxes_show_pr3209_numbers_before_codes(self):
+        expected_numbers = {
+            'ARA': 100,
+            'ELL': 130,
+            'ESP': 143,
+            'ITA': 173,
+            'KOR': 176,
+            'PTG': 183,
+            'TRK': 194,
+            'CHT': 1,
+            'ENG': 132,
+            'GER': 125,
+            'JPN': 175,
+            'PLK': 181,
+            'RUS': 185,
+            'VIT': 205,
+        }
+        self.assertEqual(
+            set(translation_gui.LANG_MAP),
+            set(translation_gui.PR3209_LANGUAGE_NUMBERS)
+        )
+
+        app = TranslationApp.__new__(TranslationApp)
+        app.lang_frame = FakeLanguageFrame()
+        app.show_all_langs = False
+        app.default_langs = list(expected_numbers)
+        app.update_stats = lambda: None
+        created_checkbuttons = {}
+
+        def make_checkbutton(master, **kwargs):
+            checkbutton = FakeLanguageCheckbutton(master, **kwargs)
+            created_checkbuttons[kwargs['text']] = checkbutton
+            return checkbutton
+
+        with patch.object(translation_gui.tk, 'BooleanVar', side_effect=FakeValue):
+            with patch.object(
+                translation_gui.ttk,
+                'Checkbutton',
+                side_effect=make_checkbutton
+            ):
+                app.update_lang_display()
+
+        for code, number in expected_numbers.items():
+            expected_label = (
+                f"{number} - {code} - {translation_gui.LANG_MAP[code]['name']}"
+            )
+            self.assertIn(expected_label, created_checkbuttons)
+            self.assertEqual(app.main_lang_frames[code].text, expected_label)
+
     def test_workflow_menu_posts_and_saves_the_selected_choice(self):
         self.assertEqual(
             translation_gui.WORKFLOW_SELECTION_OPTIONS,
