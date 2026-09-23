@@ -5,6 +5,8 @@ import tempfile
 import threading
 import time
 import unittest
+import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import patch
 
@@ -65,9 +67,42 @@ class FakeWidget:
 class FakeListbox:
     def __init__(self):
         self.delete_calls = []
+        self.insert_calls = []
 
     def delete(self, *args):
         self.delete_calls.append(args)
+
+    def insert(self, *args):
+        self.insert_calls.append(args)
+
+
+class FakeValue:
+    def __init__(self, value=''):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = value
+
+
+class FakeMenu:
+    def __init__(self):
+        self.popup_calls = []
+        self.release_calls = 0
+
+    def tk_popup(self, x_root, y_root):
+        self.popup_calls.append((x_root, y_root))
+
+    def grab_release(self):
+        self.release_calls += 1
+
+
+class FakeRightClickEvent:
+    def __init__(self, x_root, y_root):
+        self.x_root = x_root
+        self.y_root = y_root
 
 
 def build_app(response):
@@ -122,7 +157,479 @@ def wait_for_translation(app):
         time.sleep(0.01)
 
 
+def resmap_xml(content):
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        f'<ResMap><Message ID="1" Content="{content}" /></ResMap>'
+    )
+
+
+def build_mb_backup_app():
+    app = TranslationApp.__new__(TranslationApp)
+    app.file_listbox = FakeListbox()
+    app.headless = True
+    app.logger = None
+    app.log_messages = []
+    app.log = app.log_messages.append
+    app.source_files = []
+    app.source_folder = ''
+    app.source_folders = []
+    app.output_dir = ''
+    app.diskc_mode = False
+    app.diskc_root = ''
+    app.diskc_res_source = ''
+    app.diskc_xml_map = {}
+    app.diskc_plugin_source = ''
+    app.mb_backup_mode = False
+    app.mb_backup_archive_path = ''
+    app.mb_backup_input_type = ''
+    app.mb_backup_root_path = ''
+    app.mb_backup_work_dir = ''
+    app.mb_backup_sources = {}
+    app.mb_backup_output_base_path = ''
+    app.mb_backup_output_path = ''
+    app.selected_langs = []
+    app.translation_table = {}
+    return app
+
+
 class TranslationProviderTests(unittest.TestCase):
+    def test_workflow_menu_posts_and_saves_the_selected_choice(self):
+        self.assertEqual(
+            translation_gui.WORKFLOW_SELECTION_OPTIONS,
+            (
+                ('marking_cam', '打标Cam工作流'),
+                ('mb_backup', 'MB备份工作流'),
+                ('simulator', '模拟器工作流'),
+            )
+        )
+
+        app = TranslationApp.__new__(TranslationApp)
+        app.workflow_menu = FakeMenu()
+        app.workflow_choice_var = FakeValue('mb_backup')
+        app.selected_workflow = ''
+        app.log_messages = []
+        app.log = app.log_messages.append
+        save_calls = []
+        app.save_config = lambda: save_calls.append(True)
+
+        self.assertEqual(
+            app._show_workflow_menu(FakeRightClickEvent(120, 240)),
+            'break'
+        )
+        app._save_selected_workflow()
+
+        self.assertEqual(app.workflow_menu.popup_calls, [(120, 240)])
+        self.assertEqual(app.workflow_menu.release_calls, 1)
+        self.assertEqual(app.selected_workflow, 'mb_backup')
+        self.assertEqual(save_calls, [True])
+        self.assertIn('MB备份工作流', app.log_messages[0])
+        self.assertNotIn('后端尚未实现', app.log_messages[0])
+
+    def test_mb_input_preference_is_loaded_and_saved_locally(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / 'translation_config.json'
+            config_path.write_text(
+                json.dumps({'mb_backup_source_type': 'folder'}),
+                encoding='utf-8'
+            )
+            app = TranslationApp.__new__(TranslationApp)
+            app.default_langs = []
+            app.default_maximized = False
+            app.selected_workflow = ''
+            app.mb_backup_source_type = 'zip'
+            app.pack_res_default = False
+            app.api_type = 'google'
+            app.provider_configs = default_provider_configs()
+            app.baidu_app_id = ''
+            app.baidu_secret_key = ''
+            app.logger = None
+            app.log = lambda _message: None
+            original_config_file = translation_gui.CONFIG_FILE
+            translation_gui.CONFIG_FILE = str(config_path)
+            try:
+                app.load_config()
+                self.assertEqual(app.mb_backup_source_type, 'folder')
+                self.assertFalse(app.pack_res_default)
+                app.mb_backup_source_type = 'zip'
+                app.pack_res_default = True
+                app.save_config()
+            finally:
+                translation_gui.CONFIG_FILE = original_config_file
+
+            saved_config = json.loads(config_path.read_text(encoding='utf-8'))
+            self.assertEqual(saved_config['mb_backup_source_type'], 'zip')
+            self.assertTrue(saved_config['pack_res_default'])
+
+    def test_mb_backup_picker_uses_saved_input_preference_without_prompt(self):
+        app = TranslationApp.__new__(TranslationApp)
+        app.mb_backup_source_type = 'folder'
+        with patch('translation_gui.filedialog.askdirectory', return_value='C:\\MB') as askdirectory:
+            with patch('translation_gui.messagebox.askyesnocancel') as prompt:
+                self.assertEqual(app._choose_mb_backup_input(), 'C:\\MB')
+        askdirectory.assert_called_once_with(
+            title='选择已解压的MB备份文件夹',
+            mustexist=True
+        )
+        prompt.assert_not_called()
+
+        app.mb_backup_source_type = 'zip'
+        with patch(
+            'translation_gui.filedialog.askopenfilename',
+            return_value='C:\\MB.zip'
+        ) as askopenfilename:
+            with patch('translation_gui.messagebox.askyesnocancel') as prompt:
+                self.assertEqual(app._choose_mb_backup_input(), 'C:\\MB.zip')
+        askopenfilename.assert_called_once_with(
+            title='选择MB备份ZIP文件',
+            filetypes=[('MB备份 ZIP文件', '*.zip'), ('ZIP文件', '*.zip')]
+        )
+        prompt.assert_not_called()
+
+    def test_marking_cam_selection_enables_res_packing_and_dispatches_its_backend(self):
+        app = TranslationApp.__new__(TranslationApp)
+        app.workflow_choice_var = FakeValue('marking_cam')
+        app.selected_workflow = ''
+        app.pack_var = FakeValue(False)
+        app.diskc_workflow_button = FakeWidget()
+        app.log_messages = []
+        app.log = app.log_messages.append
+        app.save_config = lambda: None
+
+        app._save_selected_workflow()
+        backend_calls = []
+        app.setup_marking_cam_sources = lambda: backend_calls.append(True)
+        app._start_selected_workflow()
+
+        self.assertEqual(app.selected_workflow, 'marking_cam')
+        self.assertTrue(app.pack_var.get())
+        self.assertIn('适用于打标/玻切DiskC文件夹翻译', app.log_messages[0])
+        self.assertEqual(
+            app.diskc_workflow_button.options['text'],
+            '打标Cam工作流'
+        )
+        self.assertEqual(backend_calls, [True])
+
+    def test_mb_backup_and_simulator_default_to_no_res_packing(self):
+        for workflow_id in ('mb_backup', 'simulator'):
+            app = TranslationApp.__new__(TranslationApp)
+            app.selected_workflow = workflow_id
+            app.pack_res_default = True
+            app.pack_var = FakeValue(True)
+
+            app._apply_workflow_defaults()
+
+            self.assertFalse(app.pack_res_default)
+            self.assertFalse(app.pack_var.get())
+
+    def test_marking_cam_backend_reuses_diskc_source_setup(self):
+        app = TranslationApp.__new__(TranslationApp)
+        app.log_messages = []
+        app.log = app.log_messages.append
+        setup_calls = []
+        app.setup_diskc_sources = lambda root=None: setup_calls.append(root)
+
+        app.setup_marking_cam_sources('C:\\MarkingCam')
+
+        self.assertEqual(setup_calls, ['C:\\MarkingCam'])
+        self.assertIn('复用 DiskC 工作流后端', app.log_messages[0])
+
+    def test_mb_backup_workflow_stages_selected_resources_and_rebuilds_one_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive_path = Path(directory) / 'M3R15152_20260526_MBL_297067DA.zip'
+            with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+                archive.comment = b'mb-backup-comment'
+                archive.writestr(
+                    'AlarmMacro/AlarmMacro_CHS.xml',
+                    resmap_xml('测试')
+                )
+                archive.writestr(
+                    'OCRes/CHS/String/nested/Main.xml',
+                    resmap_xml('测试')
+                )
+                archive.writestr(
+                    'OCRes/CHT/String/nested/Main.xml',
+                    resmap_xml('旧翻译')
+                )
+                archive.writestr('BackupOnly/keep.bin', b'keep-this-data')
+
+            app = build_mb_backup_app()
+            app.setup_mb_backup_sources(str(archive_path))
+
+            self.assertTrue(app.mb_backup_mode)
+            self.assertEqual(len(app.source_files), 2)
+            self.assertEqual(
+                {source.category for source in app.mb_backup_sources.values()},
+                {'alarm_macro', 'ocres_string'}
+            )
+            self.assertTrue(
+                any('Ladder/AlarmPLC_CHS.xml' in message for message in app.log_messages)
+            )
+            self.assertTrue(
+                any('ParameterExt/ParamExt_CHS.xml' in message for message in app.log_messages)
+            )
+            self.assertTrue(
+                any('ParameterExt/ParamExt_RBit_CHS.xml' in message for message in app.log_messages)
+            )
+
+            app.selected_langs = ['ENG', 'CHT']
+            app.translation_table = {'测试': {'ENG': 'Test', 'CHT': '測試'}}
+            output_path = app.generate_mb_backup_file()
+
+            self.assertTrue(Path(output_path).is_file())
+            self.assertRegex(
+                Path(output_path).name,
+                r'^M3R15152_20260526_MBL_[0-9A-F]{8}\.zip$'
+            )
+            self.assertNotEqual(Path(output_path), archive_path)
+            self.assertEqual(app.mb_backup_work_dir, '')
+
+            with zipfile.ZipFile(output_path) as archive:
+                self.assertEqual(archive.comment, b'mb-backup-comment')
+                self.assertEqual(archive.read('BackupOnly/keep.bin'), b'keep-this-data')
+                self.assertEqual(
+                    archive.read('AlarmMacro/AlarmMacro_CHS.xml').decode('utf-8'),
+                    resmap_xml('测试')
+                )
+                self.assertEqual(len(archive.namelist()), len(set(archive.namelist())))
+
+                for language, translation in (('ENG', 'Test'), ('CHT', '測試')):
+                    for target_entry in (
+                        f'AlarmMacro/AlarmMacro_{language}.xml',
+                        f'OCRes/{language}/String/nested/Main.xml',
+                    ):
+                        root = ET.fromstring(archive.read(target_entry))
+                        self.assertEqual(root.find('Message').get('Content'), translation)
+
+            self.assertEqual(
+                f'{TranslationApp._file_crc32(output_path):08X}',
+                Path(output_path).stem.rsplit('_', 1)[1]
+            )
+
+    def test_mb_backup_selection_dispatches_to_its_backend(self):
+        app = TranslationApp.__new__(TranslationApp)
+        app.selected_workflow = 'mb_backup'
+        app.log = lambda _message: None
+        backend_calls = []
+        app.setup_mb_backup_sources = lambda: backend_calls.append(True)
+
+        app._start_selected_workflow()
+
+        self.assertEqual(backend_calls, [True])
+
+    def test_simulator_selection_dispatches_to_its_backend(self):
+        app = TranslationApp.__new__(TranslationApp)
+        app.selected_workflow = 'simulator'
+        app.log = lambda _message: None
+        backend_calls = []
+        app.setup_simulator_sources = lambda: backend_calls.append(True)
+
+        app._start_selected_workflow()
+
+        self.assertEqual(backend_calls, [True])
+
+    def test_simulator_workflow_translates_only_chs_string_xml(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'DISKC_V1.1.6'
+            string_dir = (
+                root / 'DiskC' / 'OpenCnc Shared' / 'OCRes' / 'CHS' / 'String'
+            )
+            string_dir.mkdir(parents=True)
+            source_xml = string_dir / 'nested' / 'Main.xml'
+            source_xml.parent.mkdir()
+            source_xml.write_text(resmap_xml('测试'), encoding='utf-8')
+            unrelated_xml = (
+                root / 'DiskC' / 'OpenCnc Shared' / 'OCRes' / 'CHS' / 'Other.xml'
+            )
+            unrelated_xml.write_text(resmap_xml('不应处理'), encoding='utf-8')
+
+            app = TranslationApp.__new__(TranslationApp)
+            app.file_listbox = FakeListbox()
+            app.headless = True
+            app.logger = None
+            app.log_messages = []
+            app.log = app.log_messages.append
+            app.source_files = []
+            app.source_folders = []
+            app.source_folder = ''
+            app.output_dir = ''
+            app.diskc_mode = False
+            app.diskc_root = ''
+            app.diskc_res_source = ''
+            app.diskc_xml_map = {}
+            app.diskc_plugin_source = ''
+            app.simulator_mode = False
+            app.simulator_root = ''
+            app.simulator_xml_map = {}
+            app.mb_backup_mode = False
+            app.mb_backup_archive_path = ''
+            app.mb_backup_sources = {}
+            app.selected_langs = ['ENG', 'CHT']
+            app.translation_table = {'测试': {'ENG': 'Test', 'CHT': '測試'}}
+            app.pack_var = FakeValue(False)
+
+            app.setup_simulator_sources(str(root))
+
+            self.assertTrue(app.simulator_mode)
+            self.assertEqual(
+                app.simulator_root,
+                str(root / 'DiskC')
+            )
+            self.assertEqual(len(app.source_files), 1)
+            self.assertEqual(
+                app.simulator_xml_map[app.source_files[0]],
+                'nested\\Main.xml'
+            )
+
+            with patch('translation_gui.messagebox.showinfo'):
+                app.generate_xml_files()
+
+            for language, translation in (('ENG', 'Test'), ('CHT', '測試')):
+                output = (
+                    root / 'DiskC' / 'OpenCnc Shared' / 'OCRes' /
+                    language / 'String' / 'nested' / 'Main.xml'
+                )
+                parsed = ET.fromstring(output.read_text(encoding='utf-8'))
+                self.assertEqual(
+                    parsed.find('Message').get('Content'),
+                    translation
+                )
+            self.assertFalse(
+                (root / 'DiskC' / 'OpenCnc Shared' / 'OCRes' /
+                 'ENG' / 'Other.xml').exists()
+            )
+
+    def test_mb_backup_workflow_routes_all_five_resource_categories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive_path = Path(directory) / 'MGT0001_20260730_MBL_11A2626D.zip'
+            source_entries = (
+                'AlarmMacro/AlarmMacro_CHS.xml',
+                'Ladder/AlarmPLC_CHS.xml',
+                'ParameterExt/ParamExt_CHS.xml',
+                'ParameterExt/ParamExt_RBit_CHS.xml',
+                'OCRes/CHS/String/nested/Main.xml',
+            )
+            with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+                for source_entry in source_entries:
+                    archive.writestr(source_entry, resmap_xml('测试'))
+
+            app = build_mb_backup_app()
+            app.setup_mb_backup_sources(str(archive_path))
+            app.selected_langs = ['ENG']
+            app.translation_table = {'测试': {'ENG': 'Test'}}
+            output_path = app.generate_mb_backup_file()
+
+            with zipfile.ZipFile(output_path) as archive:
+                self.assertEqual(
+                    {
+                        'AlarmMacro/AlarmMacro_ENG.xml',
+                        'Ladder/AlarmPLC_ENG.xml',
+                        'ParameterExt/ParamExt_ENG.xml',
+                        'ParameterExt/ParamExt_RBit_ENG.xml',
+                        'OCRes/ENG/String/nested/Main.xml',
+                    },
+                    {
+                        name for name in archive.namelist()
+                        if name.endswith('_ENG.xml')
+                        or name.startswith('OCRes/ENG/String/')
+                    }
+                )
+
+    def test_mb_backup_workflow_accepts_extracted_backup_folder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backup_root = Path(directory) / 'M3R15152_20260526_MBL_297067DA'
+            source_path = backup_root / 'AlarmMacro' / 'AlarmMacro_CHS.xml'
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(resmap_xml('测试'), encoding='utf-8')
+            existing_target = backup_root / 'AlarmMacro' / 'AlarmMacro_CHT.xml'
+            existing_target.write_text(resmap_xml('旧翻译'), encoding='utf-8')
+            unrelated_path = backup_root / 'BackupOnly' / 'keep.bin'
+            unrelated_path.parent.mkdir(parents=True)
+            unrelated_path.write_bytes(b'keep-this-data')
+
+            app = build_mb_backup_app()
+            app.setup_mb_backup_sources(str(backup_root))
+
+            self.assertTrue(app.mb_backup_mode)
+            self.assertEqual(app.mb_backup_input_type, 'folder')
+            self.assertEqual(app.mb_backup_root_path, str(backup_root))
+            self.assertTrue(Path(app.mb_backup_work_dir).is_dir())
+            self.assertEqual(len(app.source_files), 1)
+            staged_source = next(iter(app.mb_backup_sources.values()))
+            self.assertEqual(
+                staged_source.archive_entry,
+                'AlarmMacro/AlarmMacro_CHS.xml'
+            )
+            self.assertTrue(Path(staged_source.staged_path).is_file())
+
+            app.selected_langs = ['ENG', 'CHT']
+            app.translation_table = {'测试': {'ENG': 'Test', 'CHT': '測試'}}
+            output_path = app.generate_mb_backup_file()
+
+            self.assertTrue(Path(output_path).is_file())
+            self.assertEqual(app.mb_backup_work_dir, '')
+            self.assertRegex(
+                Path(output_path).name,
+                r'^M3R15152_20260526_MBL_[0-9A-F]{8}\.zip$'
+            )
+            self.assertEqual(
+                existing_target.read_text(encoding='utf-8'),
+                resmap_xml('旧翻译')
+            )
+
+            with zipfile.ZipFile(output_path) as archive:
+                self.assertEqual(archive.read('BackupOnly/keep.bin'), b'keep-this-data')
+                for language, translation in (('ENG', 'Test'), ('CHT', '測試')):
+                    root = ET.fromstring(
+                        archive.read(f'AlarmMacro/AlarmMacro_{language}.xml')
+                    )
+                    self.assertEqual(root.find('Message').get('Content'), translation)
+
+    def test_selected_workflow_is_loaded_and_saved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / 'translation_config.json'
+            config_path.write_text(
+                json.dumps({'selected_workflow': 'marking_cam'}),
+                encoding='utf-8'
+            )
+            app = TranslationApp.__new__(TranslationApp)
+            app.default_langs = []
+            app.default_maximized = False
+            app.selected_workflow = ''
+            app.api_type = 'google'
+            app.provider_configs = default_provider_configs()
+            app.baidu_app_id = ''
+            app.baidu_secret_key = ''
+            app.logger = None
+            app.log = lambda _message: None
+            original_config_file = translation_gui.CONFIG_FILE
+            translation_gui.CONFIG_FILE = str(config_path)
+            try:
+                app.load_config()
+                self.assertEqual(app.selected_workflow, 'marking_cam')
+                app.selected_workflow = 'simulator'
+                app.save_config()
+            finally:
+                translation_gui.CONFIG_FILE = original_config_file
+
+            saved_config = json.loads(config_path.read_text(encoding='utf-8'))
+            self.assertEqual(saved_config['selected_workflow'], 'simulator')
+
+            config_path.write_text(
+                json.dumps({'selected_workflow': 'unsupported_workflow'}),
+                encoding='utf-8'
+            )
+            app.selected_workflow = 'marking_cam'
+            translation_gui.CONFIG_FILE = str(config_path)
+            try:
+                app.load_config()
+            finally:
+                translation_gui.CONFIG_FILE = original_config_file
+
+            self.assertEqual(app.selected_workflow, '')
+            saved_config = json.loads(config_path.read_text(encoding='utf-8'))
+            self.assertEqual(saved_config['selected_workflow'], '')
+
     def test_clear_files_resets_diskc_workflow_state(self):
         app = TranslationApp.__new__(TranslationApp)
         app.file_listbox = FakeListbox()
@@ -148,6 +655,40 @@ class TranslationProviderTests(unittest.TestCase):
         self.assertEqual(app.diskc_res_source, '')
         self.assertEqual(app.diskc_xml_map, {})
         self.assertEqual(app.diskc_plugin_source, '')
+
+    def test_clear_files_deletes_mb_backup_staging_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            staging_dir = Path(directory) / 'mb-staging'
+            staging_dir.mkdir()
+            (staging_dir / 'source.xml').write_text(
+                resmap_xml('测试'),
+                encoding='utf-8'
+            )
+
+            app = TranslationApp.__new__(TranslationApp)
+            app.file_listbox = FakeListbox()
+            app.source_files = [str(staging_dir / 'source.xml')]
+            app.source_folders = []
+            app.source_folder = ''
+            app.diskc_mode = False
+            app.diskc_root = ''
+            app.diskc_res_source = ''
+            app.diskc_xml_map = {}
+            app.diskc_plugin_source = ''
+            app.mb_backup_mode = True
+            app.mb_backup_archive_path = 'backup.zip'
+            app.mb_backup_work_dir = str(staging_dir)
+            app.mb_backup_sources = {'source': object()}
+            app.mb_backup_output_path = ''
+            app.log = lambda _message: None
+
+            app.clear_files()
+
+            self.assertFalse(staging_dir.exists())
+            self.assertFalse(app.mb_backup_mode)
+            self.assertEqual(app.mb_backup_archive_path, '')
+            self.assertEqual(app.mb_backup_work_dir, '')
+            self.assertEqual(app.mb_backup_sources, {})
 
     def test_free_providers_are_listed_first(self):
         self.assertEqual(

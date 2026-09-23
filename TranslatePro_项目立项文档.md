@@ -223,7 +223,7 @@
 |------|------|
 | + 添加文件夹 | `filedialog.askdirectory` |
 | + 添加文件 | `filedialog.askopenfilename` (*.xml;*.res) |
-| DiskC 工作流 | 自动发现CNC目录结构 |
+| DiskC 工作流 | 左键执行当前预设；打标Cam复用 DiskC 后端，MB备份处理 ZIP/文件夹，模拟器仅处理 `OpenCnc Shared/OCRes/CHS/String` 下 XML |
 | 移除选中 | 删除列表选中项 |
 | 清空列表 | 清空所有文件 |
 | 打包 .res | `BooleanVar`复选框 |
@@ -336,6 +336,8 @@
 | `--langs` | - | str | None | 逗号分隔语言缩写(如CHS,ENG) |
 | `--pack` | - | flag | False | 处理后打包为.res |
 | `--diskc` | - | str | None | DiskC根目录路径 |
+| `--mb-backup` | - | str | None | MB备份 ZIP 或已解压文件夹路径 |
+| `--simulator` | - | str | None | 模拟器工作流根目录（DISKC_V1.1.6 或 DiskC 路径） |
 | `--log` | - | str | None | 日志输出文件路径 |
 | `--nogui` | - | flag | False | 无界面模式(仅命令行) |
 
@@ -489,6 +491,9 @@ UPX压缩: 启用
 ```json
 {
   "default_langs": ["ARA","CHT","ENG","ESP","FIN","FRA","GER","ITA","JPN","KOR","NLD","PLK","PTG","RUS","TRK","VIT"],
+  "selected_workflow": "",
+  "mb_backup_source_type": "zip",
+  "pack_res_default": false,
   "api_type": "google",
   "provider_configs": {
     "deepl_free": {
@@ -508,6 +513,9 @@ UPX压缩: 启用
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `default_langs` | array[string] | 见上方 | 默认选中的语言代码列表(16种) |
+| `selected_workflow` | string | "" | 在 DiskC 工作流按钮上右键选择的预设工作流：`marking_cam`、`mb_backup` 或 `simulator`。`marking_cam` 复用 DiskC 后端并默认勾选“打包 .res”；其余预设当前仅保存界面选择。 |
+| `mb_backup_source_type` | string | "zip" | MB备份工作流的默认输入类型：`zip` 直接选择 ZIP 压缩包，`folder` 直接选择已解压的 MB备份文件夹；在“设置选项”中保存后生效。 |
+| `pack_res_default` | boolean | false | “默认打包 .res”设置；在“设置选项”中保存后应用到普通 XML 输出和打标Cam工作流。 |
 | `api_type` | string | "google" | 当前服务：`deepl_free`、`baidu`、`youdao`、`niutrans`、`tencent`、`volcengine`、`aliyun`、`deepl_pro` 或 `google` |
 | `provider_configs` | object | 见上方 | 各 Provider 的密钥、端点、地域及场景配置 |
 | `baidu_app_id` | string | "" | 旧版百度 App ID 兼容字段，会同步到 `provider_configs.baidu.app_id` |
@@ -668,17 +676,37 @@ pyinstaller>=6.3.0
 3. 加载 `{root}/OpenCNC/Bin/Plugin/Config/CHS.xml` (可选)
 4. 输出: RES→`{root}/OpenCNC/Bin/Language/{LANG}`, XML→`{root}/OpenCnc Shared/OCRes/{LANG}/String/`
 
-### E. 独立工具: res_packer_gui.py
+模拟器工作流使用相同的目录根路径，但只扫描：
+
+```text
+{root}/OpenCnc Shared/OCRes/CHS/String/**/*.xml
+```
+
+如果选择的是包含 `DiskC` 子目录的版本根目录，程序会自动进入该 `DiskC` 目录。目标文件输出到对应的 `OCRes/{LANG}/String/`，不处理 RES、Plugin、AlarmMacro 或其他资源。
+
+### E. MB备份工作流说明
+
+输入可为 MB 备份 ZIP 文件或已解压的 MB 备份根文件夹。程序仅扫描并翻译以下 CHS 资源；每一类资源不存在时会记录日志并独立跳过：
+
+1. `AlarmMacro/AlarmMacro_CHS.xml` → `AlarmMacro/AlarmMacro_{LANG}.xml`
+2. `Ladder/AlarmPLC_CHS.xml` → `Ladder/AlarmPLC_{LANG}.xml`
+3. `OCRes/CHS/String/**/*.xml` → `OCRes/{LANG}/String/{同一相对路径}`
+4. `ParameterExt/ParamExt_CHS.xml` → `ParameterExt/ParamExt_{LANG}.xml`
+5. `ParameterExt/ParamExt_RBit_CHS.xml` → `ParameterExt/ParamExt_RBit_{LANG}.xml`
+
+所有选中目标语言写入同一个新 ZIP。ZIP 输入的未翻译条目与 ZIP comment 会保留；文件夹输入会先在临时目录安全打包，原文件夹不会被修改。现有目标语言资源由 CHS 源结构重新生成并覆盖，不依赖已有 CHT 文件。输出文件不会覆盖原备份，文件名使用原文件前缀与**完整生成 ZIP 字节流的 CRC32**：`{prefix}_{CRC32}.zip`。
+
+### F. 独立工具: res_packer_gui.py
 
 独立运行的XML打包工具，与translation_gui.py完全独立（无import关系）。
 - 功能: 选择XML文件 → `zlib.compress(content, 9)` → 输出`filename.xml.res`
 - 界面: 800x600窗口，文件列表+进度条+日志
 
-### F. 快捷方式创建
+### G. 快捷方式创建
 
 通过 `_generate_vbs_script()` 方法动态生成VBScript脚本，调用 `cscript //Nologo` 执行创建桌面快捷方式。脚本在运行时自动生成到 `快速设定logo和快捷方式/create_shortcut.vbs`，无需预先打包。
 
-### G. 版本历史
+### H. 版本历史
 
 | 版本 | 日期 | 主要变更 |
 |------|------|----------|
@@ -687,8 +715,14 @@ pyinstaller>=6.3.0
 | v1.2.0 | 2025-07 | DiskC工作流、Excel导入导出 |
 | v1.2.1 | 2026-07-06 | Bug修复: 添加`sys`导入; 修复`create_shortcut_only`中`script_dir`未定义; 修复`version_info.txt`项目名称错误; 修复`LANG_NATIVE_NAME`翻译错误(ESH/ARY); 删除重复代码; VBS脚本改为运行时动态生成 |
 | v1.2.2 | 2026-09-22 | 维护：翻译任务仅处理当前源文件文本，避免误翻译历史翻译记忆；清空文件列表时完整重置 DiskC 工作流状态，避免普通文件误走 DiskC 输出与清理路径 |
+| v1.2.3 | 2026-09-22 | 新增 MB备份工作流：按资源类别从 ZIP 提取 CHS XML，生成包含多语言资源的新 MB ZIP，并以完整 ZIP CRC32 命名 |
+| v1.2.4 | 2026-09-22 | MB备份工作流支持已解压的 MB备份文件夹；原文件夹保持不变，输出仍为多语言 CRC32 命名 ZIP |
+| v1.2.6 | 2026-09-22 | 将 MB备份输入类型选择移入设置选项并本地保存；工作流入口按设置直接打开 ZIP 或文件夹选择器，不再弹出类型确认 |
+| v1.2.7 | 2026-09-22 | 将“打包 .res”选项移入设置并本地保存，移除文件管理工具栏中的临时复选框 |
+| v1.2.8 | 2026-09-22 | 将 MB备份和模拟器工作流的默认“打包 .res”设为关闭，打标Cam工作流默认保持开启 |
+| v1.2.9 | 2026-09-22 | 新增模拟器工作流后端：扫描 DISKC_V1.1.6/DiskC 下 CHS/String XML，并输出各目标语言 String 文件 |
 
-### H. 已知问题
+### I. 已知问题
 
 | 问题 | 位置 | 说明 |
 |------|------|------|
@@ -697,7 +731,7 @@ pyinstaller>=6.3.0
 
 ---
 
-**文档版本**: v1.2.2
+**文档版本**: v1.2.9
 **最后更新**: 2026-09-22
 **维护者**: SYNTEC开发团队
 

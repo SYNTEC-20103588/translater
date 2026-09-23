@@ -12,6 +12,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 import xml.etree.ElementTree as ET
 import base64
+import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import formatdate
@@ -35,6 +36,8 @@ import subprocess
 import shutil
 import ctypes
 import platform
+import zipfile
+import zlib
 from PIL import Image, ImageTk
 
 # 语言映射字典 - 包含语言代码、名称和中文说明
@@ -215,6 +218,44 @@ BRAND_NAMES = {'禾川', '高创', '松下', '汇川', '迪维迅', '台达', '�
 # 配置文件名
 CONFIG_FILE = 'translation_config.json'
 
+# 右键 DiskC 按钮时可设置的待实现工作流。选择仅保存本地偏好，不改变当前 DiskC 的左键行为。
+WORKFLOW_SELECTION_OPTIONS = (
+    ('marking_cam', '打标Cam工作流'),
+    ('mb_backup', 'MB备份工作流'),
+    ('simulator', '模拟器工作流'),
+)
+WORKFLOW_SELECTION_LABELS = dict(WORKFLOW_SELECTION_OPTIONS)
+
+MB_BACKUP_FILE_SPECS = (
+    (
+        'alarm_macro',
+        'AlarmMacro/AlarmMacro_CHS.xml',
+        'AlarmMacro/AlarmMacro_{lang}.xml',
+    ),
+    (
+        'alarm_plc',
+        'Ladder/AlarmPLC_CHS.xml',
+        'Ladder/AlarmPLC_{lang}.xml',
+    ),
+    (
+        'param_ext',
+        'ParameterExt/ParamExt_CHS.xml',
+        'ParameterExt/ParamExt_{lang}.xml',
+    ),
+    (
+        'param_ext_rbit',
+        'ParameterExt/ParamExt_RBit_CHS.xml',
+        'ParameterExt/ParamExt_RBit_{lang}.xml',
+    ),
+)
+MB_BACKUP_OCRES_SOURCE_PREFIX = 'OCRes/CHS/String/'
+MB_BACKUP_OCRES_TARGET_TEMPLATE = 'OCRes/{lang}/String/{relative_path}'
+MB_BACKUP_INPUT_OPTIONS = (
+    ('zip', 'MB备份 ZIP 压缩包'),
+    ('folder', '已解压的 MB备份文件夹'),
+)
+MB_BACKUP_INPUT_LABELS = dict(MB_BACKUP_INPUT_OPTIONS)
+
 VOLCENGINE_SERVICE = 'translate'
 VOLCENGINE_DEFAULT_REGION = 'cn-beijing'
 VOLCENGINE_API_VERSION = '2020-06-01'
@@ -369,6 +410,22 @@ class TranslationResult:
     error: str = ''
 
 
+@dataclass(frozen=True)
+class MbBackupSource:
+    """One staged MB backup localization resource and its ZIP output mapping."""
+    category: str
+    archive_entry: str
+    staged_path: str
+    target_template: str
+    relative_path: str = ''
+
+    def target_entry(self, language):
+        return self.target_template.format(
+            lang=language,
+            relative_path=self.relative_path
+        )
+
+
 class TranslationProviderError(Exception):
     """An expected provider or transport error."""
 
@@ -414,7 +471,25 @@ class TranslationApp:
         self.diskc_res_source = ""    # CHS.res解压后的prepared路径
         self.diskc_xml_map = {}       # prepared_path -> 相对于String目录的子路径
         self.diskc_plugin_source = "" # Plugin/Config/CHS.xml的prepared路径
-        
+
+        # 模拟器工作流模式
+        self.simulator_mode = False
+        self.simulator_root = ""
+        self.simulator_xml_map = {}   # prepared_path -> 相对于CHS/String目录的子路径
+
+        # MB备份工作流模式
+        self.mb_backup_mode = False
+        self.mb_backup_input_type = ""
+        self.mb_backup_root_path = ""
+        self.mb_backup_archive_path = ""
+        self.mb_backup_output_base_path = ""
+        self.mb_backup_work_dir = ""
+        self.mb_backup_sources = {}
+        self.mb_backup_output_path = ""
+        self.mb_backup_source_type = "zip"
+        self.pack_res_default = False
+        self.selected_workflow = ""   # 右键工作流菜单的本地保存选择
+
         # API配置变量。保留百度旧字段，兼容已有 translation_config.json。
         self.api_type = 'google'
         self.provider_configs = default_provider_configs()
@@ -453,6 +528,12 @@ class TranslationApp:
         """
         if not hasattr(self, 'default_maximized'):
             self.default_maximized = False
+        if not hasattr(self, 'selected_workflow'):
+            self.selected_workflow = ''
+        if not hasattr(self, 'mb_backup_source_type'):
+            self.mb_backup_source_type = 'zip'
+        if not hasattr(self, 'pack_res_default'):
+            self.pack_res_default = False
         if os.path.exists(CONFIG_FILE):
             config_migrated = False
             try:
@@ -469,6 +550,31 @@ class TranslationApp:
                         self.default_maximized = legacy_fullscreen
                     if 'default_fullscreen' in config:
                         config_migrated = True
+                    saved_workflow = config.get('selected_workflow', '')
+                    if isinstance(saved_workflow, str) and saved_workflow in WORKFLOW_SELECTION_LABELS:
+                        self.selected_workflow = saved_workflow
+                    elif saved_workflow not in (None, ''):
+                        self.selected_workflow = ''
+                        config_migrated = True
+                        self.log(f"忽略不支持的工作流设置: {saved_workflow!r}")
+                    saved_mb_source_type = config.get('mb_backup_source_type', 'zip')
+                    if saved_mb_source_type in MB_BACKUP_INPUT_LABELS:
+                        self.mb_backup_source_type = saved_mb_source_type
+                    else:
+                        self.mb_backup_source_type = 'zip'
+                        if saved_mb_source_type not in (None, ''):
+                            config_migrated = True
+                            self.log(f"忽略不支持的 MB备份输入类型设置: {saved_mb_source_type!r}")
+                    saved_pack_res_default = config.get('pack_res_default')
+                    if isinstance(saved_pack_res_default, bool):
+                        self.pack_res_default = saved_pack_res_default
+                    elif self.selected_workflow == 'marking_cam':
+                        # Preserve the previous marking-CAM default for old configs.
+                        self.pack_res_default = True
+                    elif saved_pack_res_default not in (None, ''):
+                        config_migrated = True
+                        self.pack_res_default = False
+                        self.log(f"忽略不支持的打包 .res 设置: {saved_pack_res_default!r}")
                     saved_api_type = config.get('api_type')
                     if saved_api_type in API_PROVIDERS:
                         self.api_type = saved_api_type
@@ -538,9 +644,24 @@ class TranslationApp:
         将当前默认语言设置和各翻译服务的本地配置保存到translation_config.json
         """
         self._sync_legacy_baidu_credentials()
+        selected_workflow = getattr(self, 'selected_workflow', '')
+        if selected_workflow not in WORKFLOW_SELECTION_LABELS:
+            selected_workflow = ''
+            self.selected_workflow = ''
+        mb_backup_source_type = getattr(self, 'mb_backup_source_type', 'zip')
+        if mb_backup_source_type not in MB_BACKUP_INPUT_LABELS:
+            mb_backup_source_type = 'zip'
+            self.mb_backup_source_type = mb_backup_source_type
+        pack_res_default = getattr(self, 'pack_res_default', False)
+        if not isinstance(pack_res_default, bool):
+            pack_res_default = False
+            self.pack_res_default = pack_res_default
         config = {
             'default_langs': self.default_langs,
             'default_maximized': bool(getattr(self, 'default_maximized', False)),
+            'selected_workflow': selected_workflow,
+            'mb_backup_source_type': mb_backup_source_type,
+            'pack_res_default': pack_res_default,
             'api_type': self.api_type,
             'provider_configs': self.provider_configs,
             # Retain these keys so configuration files stay compatible with older releases.
@@ -673,14 +794,30 @@ class TranslationApp:
         
         ttk.Button(toolbar, text="+ 添加文件夹", command=self.add_folder).pack(side='left', padx=2)
         ttk.Button(toolbar, text="+ 添加文件", command=self.add_files).pack(side='left', padx=2)
-        ttk.Button(toolbar, text="DiskC 工作流", command=self.setup_diskc_sources).pack(side='left', padx=2)
+        self.diskc_workflow_button = ttk.Button(
+            toolbar,
+            text="DiskC 工作流",
+            command=self._start_selected_workflow
+        )
+        self.diskc_workflow_button.pack(side='left', padx=2)
+        self.workflow_choice_var = tk.StringVar(value=self.selected_workflow)
+        self.workflow_menu = tk.Menu(self.root, tearoff=False)
+        for workflow_id, workflow_label in WORKFLOW_SELECTION_OPTIONS:
+            self.workflow_menu.add_radiobutton(
+                label=workflow_label,
+                value=workflow_id,
+                variable=self.workflow_choice_var,
+                command=self._save_selected_workflow
+            )
+        self.diskc_workflow_button.bind('<Button-3>', self._show_workflow_menu)
         ttk.Button(toolbar, text="移除选中", command=self.remove_files).pack(side='left', padx=2)
         ttk.Button(toolbar, text="清空列表", command=self.clear_files).pack(side='left', padx=2)
         
         ttk.Separator(toolbar, orient='vertical').pack(side='left', fill='y', padx=8, pady=2)
         
-        self.pack_var = tk.BooleanVar()
-        ttk.Checkbutton(toolbar, text="打包 .res", variable=self.pack_var).pack(side='left', padx=4)
+        self.pack_var = tk.BooleanVar(value=self.pack_res_default)
+        self._update_workflow_button_label()
+        self._apply_workflow_defaults()
         
         ttk.Button(toolbar, text="翻译表", command=self.view_translation_table).pack(side='left', padx=2)
         ttk.Button(toolbar, text="导出Excel", command=self.export_to_excel).pack(side='left', padx=2)
@@ -981,6 +1118,41 @@ class TranslationApp:
             value='maximized'
         ).pack(anchor='w', pady=4)
 
+        ttk.Separator(settings_main, orient='horizontal').pack(
+            fill=tk.X,
+            pady=(18, 14)
+        )
+        ttk.Label(
+            settings_main,
+            text="MB备份输入类型",
+            font=('Segoe UI', 11, 'bold'),
+            foreground='#2D2B4E'
+        ).pack(anchor='w')
+        ttk.Label(
+            settings_main,
+            text="保存后，点击“MB备份工作流”会直接打开对应的选择器，不再询问输入类型。",
+            font=('Segoe UI', 9),
+            foreground='#6E6E73',
+            wraplength=620,
+            justify='left'
+        ).pack(anchor='w', pady=(4, 10))
+
+        self.mb_backup_source_type_var = tk.StringVar(
+            value=self.mb_backup_source_type
+        )
+        for source_type, label in MB_BACKUP_INPUT_OPTIONS:
+            ttk.Radiobutton(
+                settings_main,
+                text=label,
+                variable=self.mb_backup_source_type_var,
+                value=source_type
+            ).pack(anchor='w', pady=3)
+        ttk.Checkbutton(
+            settings_main,
+            text="默认打包 .res",
+            variable=self.pack_var
+        ).pack(anchor='w', pady=(10, 0))
+
         ttk.Button(
             settings_main,
             text="保存并应用",
@@ -1001,6 +1173,12 @@ class TranslationApp:
 
     def save_window_settings(self):
         self.default_maximized = self.window_mode_var.get() == 'maximized'
+        selected_source_type = self.mb_backup_source_type_var.get()
+        if selected_source_type in MB_BACKUP_INPUT_LABELS:
+            self.mb_backup_source_type = selected_source_type
+        else:
+            self.mb_backup_source_type = 'zip'
+        self.pack_res_default = bool(self.pack_var.get())
         applied = self._apply_window_mode(self.default_maximized)
         self.save_config()
         if applied:
@@ -1119,6 +1297,374 @@ class TranslationApp:
         self.diskc_xml_map = {}
         self.diskc_plugin_source = ""
 
+    def _reset_simulator_state(self):
+        self.simulator_mode = False
+        self.simulator_root = ""
+        self.simulator_xml_map = {}
+
+    def _reset_mb_backup_state(self):
+        work_dir = getattr(self, 'mb_backup_work_dir', '')
+        if work_dir and os.path.isdir(work_dir):
+            try:
+                shutil.rmtree(work_dir)
+                self.log(f"已删除 MB备份临时目录: {work_dir}")
+            except OSError as error:
+                self.log(f"删除 MB备份临时目录失败: {work_dir} -> {error}")
+        self.mb_backup_mode = False
+        self.mb_backup_input_type = ""
+        self.mb_backup_root_path = ""
+        self.mb_backup_archive_path = ""
+        self.mb_backup_output_base_path = ""
+        self.mb_backup_work_dir = ""
+        self.mb_backup_sources = {}
+        self.mb_backup_output_path = ""
+
+    def _show_workflow_menu(self, event):
+        try:
+            self.workflow_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                self.workflow_menu.grab_release()
+            except tk.TclError:
+                pass
+        return 'break'
+
+    def _save_selected_workflow(self):
+        workflow_id = self.workflow_choice_var.get()
+        workflow_label = WORKFLOW_SELECTION_LABELS.get(workflow_id)
+        if workflow_label is None:
+            self.log(f"忽略不支持的工作流选择: {workflow_id!r}")
+            return
+        self.selected_workflow = workflow_id
+        self._apply_workflow_defaults()
+        self._update_workflow_button_label()
+        self.save_config()
+        if workflow_id == 'marking_cam':
+            self.log(f"已保存工作流预设: {workflow_label}（适用于打标/玻切DiskC文件夹翻译）")
+        elif workflow_id == 'mb_backup':
+            self.log(f"已保存工作流预设: {workflow_label}（支持 ZIP 或已解压文件夹）")
+        else:
+            self.log(f"已保存工作流预设: {workflow_label}（后端尚未实现）")
+
+    def _workflow_button_label(self):
+        return WORKFLOW_SELECTION_LABELS.get(self.selected_workflow, 'DiskC 工作流')
+
+    def _update_workflow_button_label(self):
+        if hasattr(self, 'diskc_workflow_button'):
+            self.diskc_workflow_button.config(text=self._workflow_button_label())
+
+    def _apply_workflow_defaults(self):
+        if self.selected_workflow == 'marking_cam':
+            default_pack_res = True
+        elif self.selected_workflow in ('mb_backup', 'simulator'):
+            default_pack_res = False
+        else:
+            default_pack_res = getattr(self, 'pack_res_default', False)
+        self.pack_res_default = default_pack_res
+        if hasattr(self, 'pack_var'):
+            self.pack_var.set(default_pack_res)
+
+    def _start_selected_workflow(self):
+        if self.selected_workflow == 'marking_cam':
+            self.setup_marking_cam_sources()
+            return
+        if self.selected_workflow == 'mb_backup':
+            self.setup_mb_backup_sources()
+            return
+        if self.selected_workflow == 'simulator':
+            self.setup_simulator_sources()
+            return
+        if not self.selected_workflow:
+            self.setup_diskc_sources()
+            return
+
+        workflow_label = WORKFLOW_SELECTION_LABELS[self.selected_workflow]
+        message = f"{workflow_label}后端尚未实现。"
+        self.log(message)
+        messagebox.showinfo("工作流", message)
+
+    def setup_marking_cam_sources(self, marking_cam_root=None):
+        """暂时复用 DiskC 的目录发现、输出路由和 RES 打包后端。"""
+        self.log("打标Cam工作流当前复用 DiskC 工作流后端。")
+        self.setup_diskc_sources(marking_cam_root)
+
+    def setup_simulator_sources(self, simulator_root=None):
+        if simulator_root is None:
+            simulator_root = filedialog.askdirectory(
+                title="选择模拟器工作流根目录"
+            )
+            if not simulator_root:
+                return
+
+        simulator_root = os.path.abspath(simulator_root)
+        nested_diskc_root = os.path.join(simulator_root, 'DiskC')
+        if os.path.isdir(os.path.join(nested_diskc_root, 'OpenCnc Shared')):
+            simulator_root = nested_diskc_root
+
+        string_dir = os.path.join(
+            simulator_root,
+            'OpenCnc Shared',
+            'OCRes',
+            'CHS',
+            'String'
+        )
+        if not os.path.isdir(string_dir):
+            message = f"模拟器工作流未找到目录: {string_dir}"
+            self.log(message)
+            if not self.headless:
+                messagebox.showerror("模拟器工作流", message)
+            return
+
+        self._reset_mb_backup_state()
+        self._reset_diskc_state()
+        self._reset_simulator_state()
+        self.simulator_mode = True
+        self.simulator_root = simulator_root
+        self.source_files = []
+        self.source_folders = []
+        self.source_folder = simulator_root
+        self.output_dir = simulator_root
+        self.file_listbox.delete(0, tk.END)
+
+        xml_count = 0
+        for root_dir, dirs, files in os.walk(string_dir):
+            dirs.sort()
+            for file_name in sorted(files):
+                if not file_name.lower().endswith('.xml'):
+                    continue
+                full_path = os.path.join(root_dir, file_name)
+                prepared = self.prepare_file(full_path)
+                if not prepared:
+                    continue
+                relative_path = os.path.relpath(prepared, string_dir)
+                self.simulator_xml_map[prepared] = relative_path
+                self.source_files.append(prepared)
+                self.file_listbox.insert(
+                    tk.END,
+                    f"[SIM] String/{relative_path}"
+                )
+                xml_count += 1
+
+        self.update_stats()
+        message = f"模拟器工作流已就绪: {xml_count} 个 String XML 文件"
+        self.log(message)
+        if not self.headless:
+            messagebox.showinfo("模拟器工作流", message)
+
+    @staticmethod
+    def _mb_backup_staging_path(work_dir, archive_entry):
+        path_parts = archive_entry.split('/')
+        if (
+            not path_parts
+            or any(
+                not part or part in ('.', '..') or '\\' in part or ':' in part
+                for part in path_parts
+            )
+        ):
+            raise ValueError(f"MB备份包含不安全的文件路径: {archive_entry}")
+        work_dir = os.path.abspath(work_dir)
+        staged_path = os.path.abspath(os.path.join(work_dir, *path_parts))
+        if os.path.normcase(os.path.commonpath((work_dir, staged_path))) != os.path.normcase(work_dir):
+            raise ValueError(f"MB备份文件路径越界: {archive_entry}")
+        return staged_path
+
+    def _discover_mb_backup_sources(self, archive):
+        entries_by_name = {}
+        duplicate_entries = set()
+        for entry in archive.infolist():
+            if entry.is_dir():
+                continue
+            if entry.filename in entries_by_name:
+                duplicate_entries.add(entry.filename)
+            entries_by_name[entry.filename] = entry
+
+        discovered = []
+        for category, source_entry, target_template in MB_BACKUP_FILE_SPECS:
+            if source_entry in duplicate_entries:
+                raise ValueError(f"MB备份包含重复资源条目: {source_entry}")
+            entry = entries_by_name.get(source_entry)
+            if entry is None:
+                self.log(f"MB备份工作流: 跳过缺失资源 {source_entry}")
+                continue
+            discovered.append((category, entry, target_template, ''))
+
+        ocres_entries = []
+        for entry_name, entry in entries_by_name.items():
+            if (
+                entry_name.startswith(MB_BACKUP_OCRES_SOURCE_PREFIX)
+                and entry_name.lower().endswith('.xml')
+            ):
+                if entry_name in duplicate_entries:
+                    raise ValueError(f"MB备份包含重复资源条目: {entry_name}")
+                relative_path = entry_name[len(MB_BACKUP_OCRES_SOURCE_PREFIX):]
+                self._mb_backup_staging_path(tempfile.gettempdir(), relative_path)
+                ocres_entries.append((entry, relative_path))
+
+        if not ocres_entries:
+            self.log(
+                f"MB备份工作流: 跳过缺失资源 {MB_BACKUP_OCRES_SOURCE_PREFIX} 下的 XML"
+            )
+        else:
+            for entry, relative_path in sorted(ocres_entries, key=lambda item: item[0].filename):
+                discovered.append((
+                    'ocres_string',
+                    entry,
+                    MB_BACKUP_OCRES_TARGET_TEMPLATE,
+                    relative_path,
+                ))
+        return discovered
+
+    def _create_mb_backup_archive_from_folder(self, backup_root, work_dir):
+        archive_path = os.path.join(work_dir, 'source.zip')
+        with zipfile.ZipFile(
+            archive_path,
+            'w',
+            compression=zipfile.ZIP_DEFLATED,
+            allowZip64=True
+        ) as archive:
+            for root_dir, directories, files in os.walk(backup_root):
+                directories.sort()
+                for file_name in sorted(files):
+                    file_path = os.path.join(root_dir, file_name)
+                    relative_path = os.path.relpath(file_path, backup_root)
+                    archive_entry = relative_path.replace(os.sep, '/')
+                    self._mb_backup_staging_path(work_dir, archive_entry)
+                    archive.write(
+                        file_path,
+                        arcname=archive_entry,
+                        compress_type=zipfile.ZIP_DEFLATED
+                    )
+        return archive_path
+
+    def _choose_mb_backup_input(self):
+        if self.mb_backup_source_type == 'folder':
+            return filedialog.askdirectory(
+                title="选择已解压的MB备份文件夹",
+                mustexist=True
+            )
+        return filedialog.askopenfilename(
+            title="选择MB备份ZIP文件",
+            filetypes=[("MB备份 ZIP文件", "*.zip"), ("ZIP文件", "*.zip")]
+        )
+
+    def setup_mb_backup_sources(self, backup_path=None):
+        if backup_path is None:
+            backup_path = self._choose_mb_backup_input()
+            if not backup_path:
+                return
+
+        backup_path = os.path.abspath(backup_path)
+        work_dir = ''
+        input_type = ''
+        archive_path = ''
+        output_base_path = backup_path
+        if os.path.isdir(backup_path):
+            input_type = 'folder'
+            try:
+                work_dir = tempfile.mkdtemp(prefix='translate_mb_backup_')
+                archive_path = self._create_mb_backup_archive_from_folder(
+                    backup_path,
+                    work_dir
+                )
+            except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as error:
+                if work_dir and os.path.isdir(work_dir):
+                    try:
+                        shutil.rmtree(work_dir)
+                    except OSError as cleanup_error:
+                        self.log(f"清理 MB备份临时目录失败: {work_dir} -> {cleanup_error}")
+                message = f"准备已解压MB备份文件夹失败: {error}"
+                self.log(message)
+                if not self.headless:
+                    messagebox.showerror("MB备份工作流", message)
+                return
+        elif os.path.isfile(backup_path):
+            if os.path.splitext(backup_path)[1].lower() != '.zip':
+                message = f"MB备份工作流仅支持 ZIP 文件或已解压文件夹: {backup_path}"
+                self.log(message)
+                if not self.headless:
+                    messagebox.showerror("MB备份工作流", message)
+                return
+            input_type = 'zip'
+            archive_path = backup_path
+        else:
+            message = f"MB备份输入路径不存在: {backup_path}"
+            self.log(message)
+            if not self.headless:
+                messagebox.showerror("MB备份工作流", message)
+            return
+
+        try:
+            with zipfile.ZipFile(archive_path, 'r') as archive:
+                discovered = self._discover_mb_backup_sources(archive)
+                if not discovered:
+                    if work_dir and os.path.isdir(work_dir):
+                        try:
+                            shutil.rmtree(work_dir)
+                        except OSError as cleanup_error:
+                            self.log(f"清理 MB备份临时目录失败: {work_dir} -> {cleanup_error}")
+                    message = "MB备份中未找到可翻译的 CHS 资源。"
+                    self.log(message)
+                    if not self.headless:
+                        messagebox.showwarning("MB备份工作流", message)
+                    return
+
+                if not work_dir:
+                    work_dir = tempfile.mkdtemp(prefix='translate_mb_backup_')
+                staged_sources = {}
+                for category, entry, target_template, relative_path in discovered:
+                    staged_path = self._mb_backup_staging_path(work_dir, entry.filename)
+                    os.makedirs(os.path.dirname(staged_path), exist_ok=True)
+                    with archive.open(entry, 'r') as source_file, open(staged_path, 'wb') as target_file:
+                        shutil.copyfileobj(source_file, target_file)
+                    staged_sources[staged_path] = MbBackupSource(
+                        category=category,
+                        archive_entry=entry.filename,
+                        staged_path=staged_path,
+                        target_template=target_template,
+                        relative_path=relative_path,
+                    )
+        except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as error:
+            if work_dir and os.path.isdir(work_dir):
+                try:
+                    shutil.rmtree(work_dir)
+                except OSError as cleanup_error:
+                    self.log(f"清理 MB备份临时目录失败: {work_dir} -> {cleanup_error}")
+            message = f"准备MB备份工作流失败: {error}"
+            self.log(message)
+            if not self.headless:
+                messagebox.showerror("MB备份工作流", message)
+            return
+
+        self._reset_simulator_state()
+        self._reset_diskc_state()
+        self._reset_mb_backup_state()
+        self.mb_backup_mode = True
+        self.mb_backup_input_type = input_type
+        self.mb_backup_root_path = backup_path if input_type == 'folder' else ''
+        self.mb_backup_archive_path = archive_path
+        self.mb_backup_output_base_path = output_base_path
+        self.mb_backup_work_dir = work_dir
+        self.mb_backup_sources = staged_sources
+        self.source_files = list(staged_sources)
+        self.source_folders = []
+        self.source_folder = ""
+        self.output_dir = os.path.dirname(output_base_path)
+        self.file_listbox.delete(0, tk.END)
+        for source in staged_sources.values():
+            self.file_listbox.insert(
+                tk.END,
+                f"[MB:{source.category}] {source.archive_entry}"
+            )
+        self.update_stats()
+        input_label = "已解压文件夹" if input_type == 'folder' else "ZIP文件"
+        message = (
+            f"MB备份工作流已就绪（{input_label}）: "
+            f"{len(staged_sources)} 个翻译资源"
+        )
+        self.log(message)
+        if not self.headless:
+            messagebox.showinfo("MB备份工作流", message)
+
     def setup_diskc_sources(self, diskc_root=None):
         if diskc_root is None:
             folder = filedialog.askdirectory(title="选择DiskC根目录")
@@ -1126,6 +1672,8 @@ class TranslationApp:
                 return
             diskc_root = folder
 
+        self._reset_mb_backup_state()
+        self._reset_simulator_state()
         self._reset_diskc_state()
         self.diskc_root = diskc_root
         self.diskc_mode = True
@@ -1277,6 +1825,8 @@ class TranslationApp:
         self.source_folders = []
         self.source_folder = ""
         self._reset_diskc_state()
+        self._reset_simulator_state()
+        self._reset_mb_backup_state()
         self.update_stats()
     
     def toggle_lang_display(self):
@@ -3438,7 +3988,52 @@ class TranslationApp:
             result = messagebox.askyesno("确认生成", "翻译已完成，是否确认生成XML文件？")
         if result:
             self.generate_xml_files()
-    
+
+    def _build_translated_resmap_xml(self, content, lang, include_language_identity=False):
+        messages = []
+        for match in re.finditer(
+            r'<Message\b[^>]*/>',
+            content,
+            flags=re.IGNORECASE | re.DOTALL
+        ):
+            raw_elem = match.group(0)
+            content_match = (
+                re.search(r'Content\s*=\s*"(.*?)"', raw_elem) or
+                re.search(r"Content\s*=\s*'(.*?)'", raw_elem)
+            )
+            original_content = content_match.group(1) if content_match else ''
+            import html
+            messages.append((html.unescape(original_content), raw_elem))
+
+        lines = [
+            '<?xml version="1.0" encoding="utf-8"?>',
+            '<ResMap>',
+        ]
+        if include_language_identity:
+            lang_identity = LANG_NATIVE_NAME.get(lang, lang)
+            lang_identity = lang_identity.replace('\n', '&#xA;').replace('"', '&quot;')
+            lines.append(f'  <Message ID="{lang}" Content="{lang_identity}" />')
+
+        for original_content, raw_elem in messages:
+            normalized_content = self._normalize_text(original_content)
+            if normalized_content in self.translation_table and lang in self.translation_table[normalized_content]:
+                translated = self.translation_table[normalized_content][lang]
+                content_val = translated if translated and translated != original_content else original_content
+            else:
+                content_val = original_content
+
+            content_val = content_val.replace('\n', '&#xA;')
+            content_val = content_val.replace('"', '&quot;')
+            new_elem = re.sub(
+                r'Content\s*=\s*"[^"]*"',
+                f'Content="{content_val}"',
+                raw_elem
+            )
+            lines.append(f'  {new_elem.strip()}')
+
+        lines.append('</ResMap>')
+        return '\n'.join(lines), len(messages)
+
     def generate_xml_files(self):
         """
         生成各语言版本的XML文件
@@ -3465,6 +4060,10 @@ class TranslationApp:
             else:
                 messagebox.showwarning("警告", msg)
                 return
+
+        if self.mb_backup_mode:
+            self.generate_mb_backup_file()
+            return
         
         self.log("开始生成XML文件...")
         
@@ -3473,32 +4072,7 @@ class TranslationApp:
                 with open(xml_file, 'r', encoding='utf-8') as f:
                     content = f.read()
 
-                messages = []
-                # 统一使用正则提取，保留原始Message元素的完整文本（含所有属性如id/ID/Content等）
-                try:
-                    for m in re.finditer(r'<Message\b[^>]*/>', content, flags=re.IGNORECASE | re.DOTALL):
-                        raw_elem = m.group(0)
-                        id_m = (re.search(r'\bID\s*=\s*"(.*?)"', raw_elem) or
-                                re.search(r"\bID\s*=\s*'(.*?)'", raw_elem) or
-                                re.search(r'\bid\s*=\s*"(.*?)"', raw_elem) or
-                                re.search(r"\bid\s*=\s*'(.*?)'", raw_elem))
-                        msg_id = id_m.group(1) if id_m else ''
-                        cont_m = (re.search(r'Content\s*=\s*"(.*?)"', raw_elem) or
-                                  re.search(r"Content\s*=\s*'(.*?)'", raw_elem))
-                        original_content = cont_m.group(1) if cont_m else ''
-                        import html
-                        original_content = html.unescape(original_content)
-                        messages.append((msg_id, original_content, raw_elem))
-                    self.log(f"从 {os.path.basename(xml_file)} 提取 {len(messages)} 条 Message")
-                    if len(messages) == 0:
-                        content_preview = content.strip()[:120]
-                        self.log(f"警告: {os.path.basename(xml_file)} 未匹配到任何Message标签，文件预览: {content_preview}")
-                except Exception as ex_e:
-                    self.log(f"Message提取失败: {ex_e}")
-                    if self.logger:
-                        self.logger.exception(ex_e)
-
-                self.log(f"从 {os.path.basename(xml_file)} 提取 {len(messages)} 条Message（含非中文），准备生成翻译文件")
+                self.log(f"从 {os.path.basename(xml_file)} 提取 Message，准备生成翻译文件")
 
                 file_name = os.path.basename(xml_file)
                 if file_name.endswith('.xml'):
@@ -3509,6 +4083,10 @@ class TranslationApp:
                 is_diskc_res = self.diskc_mode and xml_file == self.diskc_res_source
                 is_diskc_xml = self.diskc_mode and xml_file in self.diskc_xml_map
                 is_diskc_plugin = self.diskc_mode and xml_file == self.diskc_plugin_source
+                is_simulator_xml = (
+                    self.simulator_mode
+                    and xml_file in self.simulator_xml_map
+                )
 
                 # 为每种选中的语言生成XML文件
                 for lang in self.selected_langs:
@@ -3528,44 +4106,45 @@ class TranslationApp:
                         os.makedirs(plugin_dir, exist_ok=True)
                         xml_output_path = os.path.join(plugin_dir, lang + '.xml')
                         pack_after_write = False
+                    elif is_simulator_xml:
+                        rel_path = self.simulator_xml_map[xml_file]
+                        string_dir = os.path.join(
+                            self.simulator_root,
+                            'OpenCnc Shared',
+                            'OCRes',
+                            lang,
+                            'String'
+                        )
+                        os.makedirs(
+                            os.path.join(string_dir, os.path.dirname(rel_path)),
+                            exist_ok=True
+                        )
+                        xml_output_path = os.path.join(string_dir, rel_path)
+                        pack_after_write = False
                     else:
                         xml_output_path = os.path.join(self.output_dir, lang, 'String', base_name + '.xml')
                         os.makedirs(os.path.dirname(xml_output_path), exist_ok=True)
                         pack_after_write = self.pack_var.get()
 
-                    lines = []
-                    lines.append('<?xml version="1.0" encoding="utf-8"?>')
-                    lines.append('<ResMap>')
-
-                    if pack_after_write:
-                        lang_identity = LANG_NATIVE_NAME.get(lang, lang)
-                        lang_identity = lang_identity.replace('\n', '&#xA;').replace('"', '&quot;')
-                        lines.append(f'  <Message ID="{lang}" Content="{lang_identity}" />')
-
-                    for msg_id, original_content, raw_elem in messages:
-                        normalized_content = self._normalize_text(original_content)
-                        if normalized_content in self.translation_table and lang in self.translation_table[normalized_content]:
-                            translated = self.translation_table[normalized_content][lang]
-                            content_val = translated if translated and translated != original_content else original_content
-                        else:
-                            content_val = original_content
-
-                        content_val = content_val.replace('\n', '&#xA;')
-                        content_val = content_val.replace('"', '&quot;')
-                        # 在原始元素文本中仅替换Content值，保留id/ID等其他所有属性
-                        new_elem = re.sub(
-                            r'Content\s*=\s*"[^"]*"',
-                            f'Content="{content_val}"',
-                            raw_elem
+                    rendered_xml, message_count = self._build_translated_resmap_xml(
+                        content,
+                        lang,
+                        include_language_identity=pack_after_write
+                    )
+                    if message_count == 0:
+                        content_preview = content.strip()[:120]
+                        self.log(
+                            f"警告: {os.path.basename(xml_file)} 未匹配到任何Message标签，"
+                            f"文件预览: {content_preview}"
                         )
-                        lines.append(f'  {new_elem.strip()}')
-
-                    lines.append('</ResMap>')
 
                     try:
                         with open(xml_output_path, 'w', encoding='utf-8') as f_out:
-                            f_out.write('\n'.join(lines))
-                        self.log(f"生成 {lang}: {os.path.basename(xml_output_path)} ({len(messages)} 条Message)")
+                            f_out.write(rendered_xml)
+                        self.log(
+                            f"生成 {lang}: {os.path.basename(xml_output_path)} "
+                            f"({message_count} 条Message)"
+                        )
                     except Exception as write_e:
                         self.log(f"写入文件失败: {write_e}")
                         if self.logger:
@@ -3582,7 +4161,13 @@ class TranslationApp:
         
         self._cleanup_temp_files()
         
-        if self.diskc_mode:
+        if getattr(self, 'simulator_mode', False):
+            messagebox.showinfo(
+                "完成",
+                "模拟器工作流处理完成！\n"
+                "XML文件已输出至: OpenCnc Shared/OCRes/{LANG}/String/"
+            )
+        elif self.diskc_mode:
             messagebox.showinfo("完成", f"DiskC工作流处理完成！\n"
                                 f"RES文件已打包至: OpenCNC/Bin/Language/\n"
                                 f"XML文件已输出至: OpenCnc Shared/OCRes/\n"
@@ -3591,7 +4176,203 @@ class TranslationApp:
             messagebox.showinfo("完成", "XML文件已成功生成并打包为.res文件！\n临时文件已清理")
         else:
             messagebox.showinfo("完成", "XML文件已成功生成！\n临时文件已清理")
-    
+
+    @staticmethod
+    def _file_crc32(file_path):
+        checksum = 0
+        with open(file_path, 'rb') as source_file:
+            while True:
+                chunk = source_file.read(1024 * 1024)
+                if not chunk:
+                    break
+                checksum = zlib.crc32(chunk, checksum)
+        return checksum & 0xffffffff
+
+    @staticmethod
+    def _mb_backup_output_path(archive_path, checksum):
+        archive_dir = os.path.dirname(archive_path)
+        archive_stem = os.path.splitext(os.path.basename(archive_path))[0]
+        if re.fullmatch(r'.+_[0-9A-Fa-f]{8}', archive_stem):
+            archive_stem = archive_stem.rsplit('_', 1)[0]
+        return os.path.join(archive_dir, f'{archive_stem}_{checksum:08X}.zip')
+
+    @staticmethod
+    def _copy_zip_entry(source_archive, target_archive, source_info):
+        target_info = copy.copy(source_info)
+        target_info.header_offset = 0
+        data = b'' if source_info.is_dir() else source_archive.read(source_info)
+        target_archive.writestr(
+            target_info,
+            data,
+            compress_type=source_info.compress_type
+        )
+
+    @staticmethod
+    def _generated_zip_info(source_info, target_entry):
+        target_info = copy.copy(source_info)
+        target_info.filename = target_entry
+        target_info.orig_filename = target_entry
+        target_info.header_offset = 0
+        return target_info
+
+    def _cleanup_mb_backup_temp_files(self):
+        work_dir = self.mb_backup_work_dir
+        if not work_dir:
+            return
+        if os.path.isdir(work_dir):
+            try:
+                shutil.rmtree(work_dir)
+                self.log(f"已删除 MB备份临时目录: {work_dir}")
+            except OSError as error:
+                self.log(f"删除 MB备份临时目录失败: {work_dir} -> {error}")
+                return
+        self.mb_backup_work_dir = ""
+
+    def generate_mb_backup_file(self):
+        if (
+            not self.mb_backup_archive_path
+            or not self.mb_backup_output_base_path
+            or not self.mb_backup_sources
+        ):
+            message = "MB备份工作流未准备可生成的资源。"
+            self.log(message)
+            if not self.headless:
+                messagebox.showerror("MB备份工作流", message)
+            return None
+        if not self.selected_langs:
+            message = "请至少选择一种目标语言。"
+            self.log(message)
+            if not self.headless:
+                messagebox.showwarning("MB备份工作流", message)
+            return None
+
+        target_languages = [lang for lang in self.selected_langs if lang != 'CHS']
+        if len(target_languages) != len(self.selected_langs):
+            self.log("MB备份工作流: 源语言 CHS 无需生成，已跳过。")
+        if not target_languages:
+            message = "MB备份工作流没有可生成的非 CHS 目标语言。"
+            self.log(message)
+            if not self.headless:
+                messagebox.showwarning("MB备份工作流", message)
+            return None
+
+        temporary_output_path = None
+        try:
+            generated_entries = {}
+            with zipfile.ZipFile(self.mb_backup_archive_path, 'r') as source_archive:
+                source_infos = {
+                    info.filename: info
+                    for info in source_archive.infolist()
+                    if not info.is_dir()
+                }
+                for source in self.mb_backup_sources.values():
+                    source_info = source_infos.get(source.archive_entry)
+                    if source_info is None:
+                        raise ValueError(
+                            f"原始MB备份中缺少已准备资源: {source.archive_entry}"
+                        )
+                    try:
+                        source_content = source_archive.read(source_info).decode('utf-8')
+                    except UnicodeDecodeError as error:
+                        raise ValueError(
+                            f"MB备份资源不是 UTF-8 XML: {source.archive_entry}"
+                        ) from error
+
+                    for lang in target_languages:
+                        target_entry = source.target_entry(lang)
+                        if target_entry in generated_entries:
+                            raise ValueError(
+                                f"MB备份目标资源路径重复: {target_entry}"
+                            )
+                        rendered_xml, message_count = self._build_translated_resmap_xml(
+                            source_content,
+                            lang
+                        )
+                        if message_count == 0:
+                            self.log(
+                                f"MB备份工作流: {source.archive_entry} 未匹配到 Message，"
+                                "将保留空 ResMap 输出。"
+                            )
+                        generated_entries[target_entry] = (
+                            source_info,
+                            rendered_xml.encode('utf-8'),
+                        )
+
+                output_dir = os.path.dirname(self.mb_backup_output_base_path)
+                file_descriptor, temporary_output_path = tempfile.mkstemp(
+                    prefix='.mb_backup.',
+                    suffix='.zip',
+                    dir=output_dir
+                )
+                os.close(file_descriptor)
+                with zipfile.ZipFile(
+                    temporary_output_path,
+                    'w',
+                    compression=zipfile.ZIP_DEFLATED,
+                    allowZip64=True
+                ) as target_archive:
+                    target_archive.comment = source_archive.comment
+                    for source_info in source_archive.infolist():
+                        if source_info.filename in generated_entries:
+                            continue
+                        self._copy_zip_entry(
+                            source_archive,
+                            target_archive,
+                            source_info
+                        )
+                    for target_entry in sorted(generated_entries):
+                        source_info, rendered_xml = generated_entries[target_entry]
+                        target_archive.writestr(
+                            self._generated_zip_info(source_info, target_entry),
+                            rendered_xml,
+                            compress_type=source_info.compress_type
+                        )
+
+            checksum = self._file_crc32(temporary_output_path)
+            output_path = self._mb_backup_output_path(
+                self.mb_backup_output_base_path,
+                checksum
+            )
+            source_zip_path = os.path.normcase(
+                os.path.abspath(self.mb_backup_archive_path)
+            )
+            if (
+                self.mb_backup_input_type == 'zip'
+                and os.path.normcase(os.path.abspath(output_path)) == source_zip_path
+            ):
+                raise ValueError("生成后的 MB备份 CRC32 未变化，已拒绝覆盖原始备份。")
+            if (
+                self.mb_backup_input_type == 'folder'
+                and os.path.normcase(os.path.abspath(output_path)) == os.path.normcase(
+                    f"{os.path.abspath(self.mb_backup_root_path)}.zip"
+                )
+            ):
+                raise ValueError("生成后的 MB备份将覆盖同名原始ZIP，已拒绝写入。")
+            os.replace(temporary_output_path, output_path)
+            temporary_output_path = None
+        except (OSError, RuntimeError, ValueError, zipfile.BadZipFile, zipfile.LargeZipFile) as error:
+            if temporary_output_path and os.path.exists(temporary_output_path):
+                try:
+                    os.remove(temporary_output_path)
+                except OSError as cleanup_error:
+                    self.log(f"清理 MB备份临时ZIP失败: {temporary_output_path} -> {cleanup_error}")
+            message = f"生成MB备份失败: {error}"
+            self.log(message)
+            if not self.headless:
+                messagebox.showerror("MB备份工作流", message)
+            return None
+
+        self.mb_backup_output_path = output_path
+        self._cleanup_mb_backup_temp_files()
+        message = (
+            f"MB备份工作流处理完成：已生成 {len(target_languages)} 种语言，"
+            f"共写入 {len(generated_entries)} 个翻译资源。\n{output_path}"
+        )
+        self.log(message)
+        if not self.headless:
+            messagebox.showinfo("MB备份工作流", message)
+        return output_path
+
     def _cleanup_temp_files(self):
         import shutil
         
@@ -4125,11 +4906,13 @@ if __name__ == '__main__':
     parser.add_argument('--api', choices=list(API_PROVIDERS), help='翻译服务，例如 deepl_free、baidu、tencent')
     parser.add_argument('--pack', action='store_true', help='处理后是否打包为.res')
     parser.add_argument('--diskc', help='DiskC工作流模式: 指定DiskC根目录路径')
+    parser.add_argument('--mb-backup', help='MB备份工作流模式: 指定MB备份ZIP或已解压文件夹路径')
+    parser.add_argument('--simulator', help='模拟器工作流模式: 指定DISKC_V1.1.6或DiskC根目录路径')
     parser.add_argument('--log', help='将详细日志写入指定文件')
     parser.add_argument('--nogui', action='store_true', help='无界面模式（仅命令行）')
     args = parser.parse_args()
 
-    if args.nogui or args.input or args.diskc:
+    if args.nogui or args.input or args.diskc or args.mb_backup or args.simulator:
         # headless / CLI 模式
         root = tk.Tk()
         root.withdraw()
@@ -4157,7 +4940,23 @@ if __name__ == '__main__':
             app.selected_langs = app.default_langs.copy()
 
         # 准备输入文件列表
-        if args.diskc:
+        if args.simulator:
+            if os.path.isdir(args.simulator):
+                app.selected_workflow = 'simulator'
+                app.log(f'模拟器工作流模式: {args.simulator}')
+                app.setup_simulator_sources(args.simulator)
+            else:
+                app.log(f'模拟器路径无效: {args.simulator}')
+                exit(1)
+        elif args.mb_backup:
+            if os.path.isfile(args.mb_backup) or os.path.isdir(args.mb_backup):
+                app.selected_workflow = 'mb_backup'
+                app.log(f'MB备份工作流模式: {args.mb_backup}')
+                app.setup_mb_backup_sources(args.mb_backup)
+            else:
+                app.log(f'MB备份文件路径无效: {args.mb_backup}')
+                exit(1)
+        elif args.diskc:
             if os.path.isdir(args.diskc):
                 app.log(f'DiskC工作流模式: {args.diskc}')
                 app.setup_diskc_sources(args.diskc)
